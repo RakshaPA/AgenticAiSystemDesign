@@ -1,0 +1,10 @@
+.env
+resume_screener/.env
+resume_screener.db
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+.vscode/

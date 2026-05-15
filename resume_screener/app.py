@@ -1,145 +1,185 @@
-import csv
+# resume_screener/app.py
+import uuid
 import io
-from pathlib import Path
-from uuid import uuid4
-
-from docx import Document
-from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+import pdfplumber  # or use your existing text extractor
 
-from .agents.matcher_agent import match_candidate
-from .agents.parser_agent import parse_resume
-from .agents.bias_agent import check_bias
-from .agents.shortlist_agent import make_decision
-from .audit import AuditLogger
-from .orchestrator import PipelineOrchestrator
-from .schemas import ShortlistEntry
+from db import get_db, engine, Base
+from models import Resume, JobDescription, AuditLog, DecisionStatus
+from schemas import (JobDescriptionCreate, JobDescriptionOut,
+                     ResumeEvaluationOut, AuditLogOut, ReviewerDecision)
+from orchestrator import run_screening_pipeline
+from agents.embedder import get_embedding
+import models
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+app = FastAPI(title="Resume Screener API v2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI(
-    title="AI Resume Screener API",
-    description="Backend API for React resume screening dashboard",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "message": "Resume Screener API v2",
+        "docs": "Visit http://127.0.0.1:8000/docs for interactive documentation",
+        "endpoints": {
+            "POST /jobs": "Create a new job description",
+            "GET /jobs/{job_id}": "Get a job description",
+            "POST /resumes/evaluate": "Evaluate resumes against a job",
+            "GET /audit/{resume_id}": "Get audit log for a resume"
+        }
+    }
 
-orchestrator = PipelineOrchestrator()
-audit_logger = AuditLogger()
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-ALLOWED_EXTENSIONS = {".pdf", ".docx"}
+# ── Job Description Endpoints ─────────────────────────────────────────────────
 
+@app.post("/jobs", response_model=JobDescriptionOut)
+async def create_job(payload: JobDescriptionCreate, db: AsyncSession = Depends(get_db)):
+    """Create JD and pre-compute its embedding for vector matching."""
+    jd_text = f"{payload.title}\n{payload.description}\nRequired: {', '.join(payload.required_skills)}"
+    embedding = await get_embedding(jd_text)
+    
+    jd = JobDescription(
+        id=str(uuid.uuid4()),
+        **payload.dict(),
+        embedding=embedding
+    )
+    db.add(jd)
+    await db.commit()
+    await db.refresh(jd)
+    return jd
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    try:
-        import pdfplumber
+@app.get("/jobs/{job_id}", response_model=JobDescriptionOut)
+async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
+    jd = await db.get(JobDescription, job_id)
+    if not jd:
+        raise HTTPException(404, "Job not found")
+    return jd
 
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    except Exception:
-        pass
+# ── Resume Upload + Evaluate ──────────────────────────────────────────────────
 
-    try:
-        import fitz
-
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        return "\n".join(page.get_text() for page in doc)
-    except Exception:
-        return ""
-
-
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    document = Document(io.BytesIO(file_bytes))
-    return "\n".join(paragraph.text for paragraph in document.paragraphs)
-
-
-def extract_text(file_name: str, file_bytes: bytes) -> str:
-    extension = Path(file_name).suffix.lower()
-    if extension == ".pdf":
-        return extract_text_from_pdf(file_bytes)
-    if extension == ".docx":
-        return extract_text_from_docx(file_bytes)
-    return ""
-
-
-@app.get("/api/health")
-def health_check() -> dict[str, str]:
-    return {"status": "ok", "app": "AI Resume Screener API"}
-
-
-@app.post("/api/jobs", status_code=status.HTTP_201_CREATED)
-def create_job(job_id: str = Form(...), jd_text: str = Form(...)) -> dict[str, str]:
-    if not jd_text.strip():
-        raise HTTPException(status_code=400, detail="Job description must not be empty.")
-    audit_logger.create_job(job_id, jd_text)
-    return {"job_id": job_id, "status": "created"}
-
-
-@app.post("/api/upload-resume", status_code=status.HTTP_202_ACCEPTED)
-async def upload_resume(
-    background_tasks: BackgroundTasks,
+@app.post("/jobs/{job_id}/resumes", response_model=ResumeEvaluationOut)
+async def upload_and_evaluate_resume(
+    job_id: str,
     file: UploadFile = File(...),
-    job_id: str = Form(...),
-) -> dict[str, str]:
-    extension = Path(file.filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
-
-    job = audit_logger.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job ID not found.")
-
-    file_bytes = await file.read()
-    raw_text = extract_text(file.filename, file_bytes)
-    if not raw_text.strip():
-        raise HTTPException(status_code=422, detail="Could not extract text from the uploaded resume.")
-
-    candidate_id = str(uuid4())
-    audit_logger.create_candidate(candidate_id, job_id, file.filename, raw_text)
-    background_tasks.add_task(orchestrator.run_pipeline, candidate_id)
-
-    return {"candidate_id": candidate_id, "status": "queued"}
-
-
-@app.get("/api/shortlist/{job_id}", response_model=list[ShortlistEntry])
-def get_shortlist(job_id: str) -> list[ShortlistEntry]:
-    results = audit_logger.get_results_for_job(job_id)
-    if not results:
-        raise HTTPException(status_code=404, detail="No results available for this job ID.")
-    return [ShortlistEntry.model_validate(item) for item in results]
-
-
-@app.get("/api/audit/{candidate_id}")
-def get_audit_trail(candidate_id: str) -> list[dict]:
-    trail = audit_logger.get_full_audit_trail(candidate_id)
-    if not trail:
-        raise HTTPException(status_code=404, detail="Audit trail not found for candidate.")
-    return trail
-
-
-@app.get("/api/shortlist/{job_id}/csv")
-def download_results_csv(job_id: str) -> Response:
-    results = audit_logger.get_results_for_job(job_id)
-    if not results:
-        raise HTTPException(status_code=404, detail="No results available for this job ID.")
-
-    output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["candidate_id", "file_name", "job_id", "match_score", "decision", "reason", "bias_passed", "timestamp"],
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Single resume upload + full pipeline evaluation.
+    For bulk: use /jobs/{job_id}/resumes/bulk
+    """
+    jd = await db.get(JobDescription, job_id)
+    if not jd:
+        raise HTTPException(404, "Job not found")
+    
+    # Extract text from PDF/DOCX
+    content = await file.read()
+    raw_text = extract_text(content, file.filename)
+    
+    resume_id = str(uuid.uuid4())
+    
+    # Save initial resume record
+    resume = Resume(
+        id=resume_id, job_id=job_id,
+        original_filename=file.filename,
+        raw_text=raw_text
     )
-    writer.writeheader()
-    for row in results:
-        writer.writerow(row)
-
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=screening_results_{job_id}.csv"},
+    db.add(resume)
+    await db.commit()
+    
+    # Run full pipeline
+    jd_dict = {
+        "id": jd.id, "title": jd.title,
+        "required_skills": jd.required_skills,
+        "preferred_skills": jd.preferred_skills,
+        "min_experience_years": jd.min_experience_years,
+        "required_certifications": jd.required_certifications,
+        "embedding": jd.embedding,
+    }
+    
+    result = await run_screening_pipeline(resume_id, job_id, raw_text, jd_dict)
+    
+    return ResumeEvaluationOut(
+        resume_id=resume_id,
+        job_id=job_id,
+        vector_similarity_score=result["vector_similarity"],
+        score_breakdown=result["score_result"]["score_breakdown"],
+        weighted_score=result["score_result"]["weighted_score"],
+        decision=result["decision"],
+        llm_explanation=result.get("llm_explanation"),
+        bias_fields_removed=result["bias_fields_removed"],
+        guardrail_violations=result.get("guardrail_violations", [])
     )
+
+# ── Audit & Review Endpoints ──────────────────────────────────────────────────
+
+@app.get("/jobs/{job_id}/shortlist", response_model=list[AuditLogOut])
+async def get_shortlist(job_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.job_id == job_id, AuditLog.decision == DecisionStatus.shortlisted)
+        .order_by(AuditLog.created_at.desc())
+    )
+    return result.scalars().all()
+
+@app.get("/jobs/{job_id}/review-queue", response_model=list[AuditLogOut])
+async def get_review_queue(job_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.job_id == job_id, AuditLog.decision == DecisionStatus.review)
+        .order_by(AuditLog.created_at.desc())
+    )
+    return result.scalars().all()
+
+@app.patch("/resumes/{resume_id}/review", response_model=AuditLogOut)
+async def submit_reviewer_decision(
+    resume_id: str,
+    payload: ReviewerDecision,
+    db: AsyncSession = Depends(get_db)
+):
+    """HR reviewer can override borderline decisions with notes."""
+    from sqlalchemy import select, update
+    audit = await db.execute(
+        select(AuditLog).where(AuditLog.resume_id == resume_id)
+    )
+    audit = audit.scalar_one_or_none()
+    if not audit:
+        raise HTTPException(404, "Audit log not found")
+    
+    audit.decision = payload.decision
+    audit.reviewer_override = True
+    audit.reviewer_notes = payload.notes
+    await db.commit()
+    await db.refresh(audit)
+    return audit
+
+@app.get("/audit/{resume_id}", response_model=AuditLogOut)
+async def get_audit_log(resume_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    result = await db.execute(
+        select(AuditLog).where(AuditLog.resume_id == resume_id)
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(404, "Audit log not found")
+    return log
+
+# ── Helper ────────────────────────────────────────────────────────────────────
+def extract_text(content: bytes, filename: str) -> str:
+    """Extract raw text from PDF or DOCX."""
+    if filename.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    elif filename.endswith(".docx"):
+        import docx
+        doc = docx.Document(io.BytesIO(content))
+        return "\n".join(p.text for p in doc.paragraphs)
+    return content.decode("utf-8", errors="ignore")

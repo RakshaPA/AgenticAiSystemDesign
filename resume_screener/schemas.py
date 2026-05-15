@@ -1,54 +1,61 @@
-from pydantic import BaseModel
+# resume_screener/schemas.py
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from enum import Enum
 
+class DecisionStatus(str, Enum):
+    shortlisted = "shortlisted"
+    review = "review"
+    rejected = "rejected"
 
-class RawResume(BaseModel):
-    candidate_id: str
-    raw_text: str
-    file_name: str
+class JobDescriptionCreate(BaseModel):
+    title: str
+    description: str
+    required_skills: List[str] = []
+    preferred_skills: List[str] = []
+    min_experience_years: float = 0
+    required_certifications: List[str] = []
 
+class JobDescriptionOut(JobDescriptionCreate):
+    id: str
+    class Config:
+        from_attributes = True
 
-class ParsedCandidate(BaseModel):
-    candidate_id: str
-    skills: list[str]
-    experience_years: float
-    education: str
-    certifications: list[str]
-    has_work_gaps: bool
+class ScoreBreakdown(BaseModel):
+    required_skills_score: float      # 0-100
+    preferred_skills_score: float     # 0-100
+    experience_score: float           # 0-100
+    project_relevance_score: float    # 0-100
+    certification_score: float        # 0-100
+    weighted_total: float             # final weighted score
 
-
-class MatchResult(BaseModel):
-    candidate_id: str
+class ResumeEvaluationOut(BaseModel):
+    resume_id: str
     job_id: str
-    match_score: float
-    matched_skills: list[str]
-    missing_skills: list[str]
-    score_rationale: str
+    vector_similarity_score: float
+    score_breakdown: ScoreBreakdown
+    weighted_score: float
+    decision: DecisionStatus
+    llm_explanation: Optional[str]
+    bias_fields_removed: List[str]
+    guardrail_violations: List[str] = []
 
-
-class BiasCheckResult(BaseModel):
-    candidate_id: str
-    passed: bool
-    pii_found: list[str]
-    bias_flags: list[str]
-    requires_human_review: bool
-
-
-class ShortlistEntry(BaseModel):
-    candidate_id: str
-    file_name: str
+class AuditLogOut(BaseModel):
+    id: str
+    resume_id: str
     job_id: str
-    match_score: float
-    decision: str
-    reason: str
-    bias_passed: bool
-    timestamp: str
+    decision: DecisionStatus
+    vector_similarity_score: float
+    weighted_score: float
+    score_breakdown: Dict[str, Any]
+    bias_fields_removed: List[str]
+    guardrail_violations: List[str]
+    llm_explanation: Optional[str]
+    reviewer_override: bool
+    reviewer_notes: Optional[str]
+    class Config:
+        from_attributes = True
 
-
-class AuditRecord(BaseModel):
-    log_id: str
-    candidate_id: str
-    job_id: str
-    stage: str
-    decision: str
-    details: str
-    timestamp: str
+class ReviewerDecision(BaseModel):
+    decision: DecisionStatus
+    notes: Optional[str] = None

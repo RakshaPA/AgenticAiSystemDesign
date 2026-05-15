@@ -1,120 +1,149 @@
-import io
-import json
-from uuid import uuid4
-from datetime import datetime
-from typing import Optional
+# resume_screener/orchestrator.py
+"""
+LangGraph Orchestrator — Updated Pipeline
 
-from .db import SessionLocal
-from .models import Candidate, JobDescription
-from .schemas import RawResume, ShortlistEntry, AuditRecord
-from .guardrails import GuardrailEnforcer
-from .audit import AuditLogger
-from .agents.parser_agent import parse_resume
-from .agents.matcher_agent import match_candidate
-from .agents.bias_agent import check_bias
-from .agents.shortlist_agent import make_decision
+Flow:
+  upload → scrub_bias → parse → embed → vector_filter → score → [explain if needed] → audit
 
+Guardrails enforced at each node boundary.
+LLM only called at: parse + explain (shortlisted/review only)
+"""
+import uuid
+import datetime
+from typing import TypedDict, Optional
+from langgraph.graph import StateGraph, END
 
-class PipelineOrchestrator:
+from agents.bias_scrubber import scrub_bias, guardrail_check_bias_fields
+from agents.parser import parse_resume
+from agents.embedder import get_embedding, cosine_similarity
+from agents.scorer import run_scorer
+from agents.explainer import generate_explanation
+from guardrails import enforce_guardrails
+from audit import write_audit_log
 
-    def __init__(self):
-        self.guardrails = GuardrailEnforcer()
-        self.logger = AuditLogger()
+# ── State schema ─────────────────────────────────────────────────────────────
+class ScreeningState(TypedDict):
+    resume_id: str
+    job_id: str
+    raw_text: str
+    jd: dict                         # full JD dict from DB
+    # populated progressively
+    cleaned_text: Optional[str]
+    bias_fields_removed: Optional[list]
+    structured_data: Optional[dict]
+    resume_embedding: Optional[list]
+    vector_similarity: Optional[float]
+    score_result: Optional[dict]
+    decision: Optional[str]
+    llm_explanation: Optional[str]
+    guardrail_violations: list
+    error: Optional[str]
 
-    def _load_candidate(self, candidate_id: str) -> Optional[Candidate]:
-        with SessionLocal() as session:
-            return session.get(Candidate, candidate_id)
+# ── Node: Bias Scrubber ──────────────────────────────────────────────────────
+async def node_scrub_bias(state: ScreeningState) -> ScreeningState:
+    cleaned, removed = scrub_bias(state["raw_text"])
+    return {**state, "cleaned_text": cleaned, "bias_fields_removed": removed}
 
-    def _load_job(self, job_id: str) -> Optional[JobDescription]:
-        with SessionLocal() as session:
-            return session.get(JobDescription, job_id)
+# ── Node: Resume Parser ──────────────────────────────────────────────────────
+async def node_parse_resume(state: ScreeningState) -> ScreeningState:
+    structured = await parse_resume(state["cleaned_text"])
+    
+    # GUARDRAIL: ensure parsed output has no leaked PII
+    violations = guardrail_check_bias_fields(structured)
+    existing = state.get("guardrail_violations", [])
+    
+    return {**state, "structured_data": structured,
+            "guardrail_violations": existing + violations}
 
-    def run_pipeline(self, candidate_id: str) -> None:
-        candidate = self._load_candidate(candidate_id)
-        if candidate is None:
-            return
+# ── Node: Embed Resume ───────────────────────────────────────────────────────
+async def node_embed_resume(state: ScreeningState) -> ScreeningState:
+    embedding = await get_embedding(state["cleaned_text"])
+    jd_embedding = state["jd"].get("embedding")  # pre-stored in DB
+    
+    sim = cosine_similarity(embedding, jd_embedding) if jd_embedding else 0.5
+    
+    return {**state, "resume_embedding": embedding, "vector_similarity": sim}
 
-        job = self._load_job(candidate.job_id)
-        if job is None:
-            return
+# ── Node: Score ──────────────────────────────────────────────────────────────
+async def node_score(state: ScreeningState) -> ScreeningState:
+    score_result = run_scorer(
+        state["structured_data"],
+        state["jd"],
+        state["vector_similarity"]
+    )
+    
+    # GUARDRAIL: cannot shortlist below threshold (enforced in scorer but double-checked)
+    violations = enforce_guardrails(score_result, state)
+    existing = state.get("guardrail_violations", [])
+    
+    return {
+        **state,
+        "score_result": score_result,
+        "decision": score_result["decision"],
+        "guardrail_violations": existing + violations,
+    }
 
-        stages_completed: list[str] = []
-        try:
-            raw = RawResume(candidate_id=candidate.candidate_id, raw_text=candidate.raw_text, file_name=candidate.file_name)
+# ── Node: LLM Explain ───────────────────────────────────────────────────────
+async def node_explain(state: ScreeningState) -> ScreeningState:
+    explanation = await generate_explanation(
+        decision=state["decision"],
+        score_breakdown=state["score_result"]["score_breakdown"],
+        structured_data=state["structured_data"],
+        jd=state["jd"],
+    )
+    return {**state, "llm_explanation": explanation}
 
-            parsed = parse_resume(raw)
-            self.logger.update_candidate_profile(candidate_id, parsed.model_dump(), status="processing")
-            violations = self.guardrails.validate_parsed_candidate(parsed)
-            self.logger.log_stage(AuditRecord(
-                log_id=str(uuid4()),
-                candidate_id=candidate.candidate_id,
-                job_id=candidate.job_id,
-                stage="parsing",
-                decision="ok" if not violations else "violation",
-                details=json.dumps(parsed.model_dump()),
-                timestamp=datetime.now().isoformat(),
-            ))
-            stages_completed.append("parsing")
+# ── Node: Audit Log ──────────────────────────────────────────────────────────
+async def node_audit(state: ScreeningState) -> ScreeningState:
+    await write_audit_log(state)
+    return state
 
-            match_result = match_candidate(parsed, job.jd_text, candidate.job_id)
-            self.logger.log_stage(AuditRecord(
-                log_id=str(uuid4()),
-                candidate_id=candidate.candidate_id,
-                job_id=candidate.job_id,
-                stage="matching",
-                decision=f"score:{match_result.match_score:.1f}",
-                details=json.dumps(match_result.model_dump()),
-                timestamp=datetime.now().isoformat(),
-            ))
-            stages_completed.append("matching")
+# ── Routing: skip LLM explain for pure rejections to save cost ───────────────
+def route_after_score(state: ScreeningState) -> str:
+    # Always explain shortlisted and review; use template for rejected (in explainer)
+    return "explain"  # explainer handles template vs LLM internally
 
-            bias_result = check_bias(parsed, candidate.raw_text)
-            self.logger.log_stage(AuditRecord(
-                log_id=str(uuid4()),
-                candidate_id=candidate.candidate_id,
-                job_id=candidate.job_id,
-                stage="bias_check",
-                decision="passed" if bias_result.passed else "flagged",
-                details=json.dumps(bias_result.model_dump()),
-                timestamp=datetime.now().isoformat(),
-            ))
-            stages_completed.append("bias_check")
+# ── Build Graph ───────────────────────────────────────────────────────────────
+def build_screening_graph() -> StateGraph:
+    graph = StateGraph(ScreeningState)
+    
+    graph.add_node("scrub_bias", node_scrub_bias)
+    graph.add_node("parse_resume", node_parse_resume)
+    graph.add_node("embed_resume", node_embed_resume)
+    graph.add_node("score", node_score)
+    graph.add_node("explain", node_explain)
+    graph.add_node("audit", node_audit)
+    
+    graph.set_entry_point("scrub_bias")
+    graph.add_edge("scrub_bias", "parse_resume")
+    graph.add_edge("parse_resume", "embed_resume")
+    graph.add_edge("embed_resume", "score")
+    graph.add_conditional_edges("score", route_after_score, {"explain": "explain"})
+    graph.add_edge("explain", "audit")
+    graph.add_edge("audit", END)
+    
+    return graph.compile()
 
-            if not self.guardrails.check_pipeline_integrity(stages_completed):
-                raise RuntimeError("Pipeline integrity violation: bias check missing")
+screening_graph = build_screening_graph()
 
-            entry = make_decision(match_result, bias_result, candidate.file_name)
-            self.logger.log_stage(AuditRecord(
-                log_id=str(uuid4()),
-                candidate_id=candidate.candidate_id,
-                job_id=candidate.job_id,
-                stage="shortlisting",
-                decision=entry.decision,
-                details=json.dumps(entry.model_dump()),
-                timestamp=datetime.now().isoformat(),
-            ))
-            self.logger.log_final_decision(entry)
-            self.logger.update_candidate_profile(candidate_id, parsed.model_dump(), status="completed")
-
-        except Exception as exc:
-            self.logger.update_candidate_profile(candidate_id, {}, status="failed")
-            fallback = ShortlistEntry(
-                candidate_id=candidate.candidate_id,
-                file_name=candidate.file_name,
-                job_id=candidate.job_id,
-                match_score=0.0,
-                decision="manual_review",
-                reason=f"Pipeline error — manual review required. Error: {str(exc)[:100]}",
-                bias_passed=False,
-                timestamp=datetime.now().isoformat(),
-            )
-            self.logger.log_stage(AuditRecord(
-                log_id=str(uuid4()),
-                candidate_id=candidate.candidate_id,
-                job_id=candidate.job_id,
-                stage="shortlisting",
-                decision="manual_review",
-                details=json.dumps(fallback.model_dump()),
-                timestamp=datetime.now().isoformat(),
-            ))
-            self.logger.log_final_decision(fallback)
+async def run_screening_pipeline(
+    resume_id: str, job_id: str, raw_text: str, jd: dict
+) -> ScreeningState:
+    initial_state: ScreeningState = {
+        "resume_id": resume_id,
+        "job_id": job_id,
+        "raw_text": raw_text,
+        "jd": jd,
+        "cleaned_text": None,
+        "bias_fields_removed": None,
+        "structured_data": None,
+        "resume_embedding": None,
+        "vector_similarity": None,
+        "score_result": None,
+        "decision": None,
+        "llm_explanation": None,
+        "guardrail_violations": [],
+        "error": None,
+    }
+    result = await screening_graph.ainvoke(initial_state)
+    return result

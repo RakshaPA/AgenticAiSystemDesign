@@ -1,57 +1,70 @@
-from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, ForeignKey, JSON, String, Text, Boolean
+# resume_screener/models.py
+from sqlalchemy import Column, String, Integer, Float, JSON, Text, DateTime, Enum, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
+from db import Base
+import enum, datetime
+import os
 
-from .db import Base
+# Try to use pgvector if available (PostgreSQL), otherwise use Text for SQLite
+try:
+    from pgvector.sqlalchemy import Vector
+    VECTOR_AVAILABLE = True
+except ImportError:
+    VECTOR_AVAILABLE = False
+    # Create a mock Vector type for SQLite
+    Vector = lambda dim: Text
 
+class DecisionStatus(str, enum.Enum):
+    shortlisted = "shortlisted"
+    review = "review"
+    rejected = "rejected"
 
 class JobDescription(Base):
     __tablename__ = "job_descriptions"
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    required_skills = Column(JSON, default=[])       # ["Python", "FastAPI"]
+    preferred_skills = Column(JSON, default=[])      # ["Docker", "Redis"]
+    min_experience_years = Column(Float, default=0)
+    required_certifications = Column(JSON, default=[])
+    embedding = Column(Vector(1536), nullable=True)   # pgvector column
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resumes = relationship("Resume", back_populates="job")
 
-    job_id = Column(String, primary_key=True, index=True)
-    jd_text = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+class Resume(Base):
+    __tablename__ = "resumes"
+    id = Column(String, primary_key=True)
+    job_id = Column(String, ForeignKey("job_descriptions.id"), nullable=False)
+    original_filename = Column(String)
+    raw_text = Column(Text)                          # original extracted text
+    cleaned_text = Column(Text)                      # bias-scrubbed text
+    structured_data = Column(JSON)                   # parsed JSON (skills, exp, etc.)
+    bias_scrubbed_fields = Column(JSON)              # what was removed + why
+    embedding = Column(Vector(1536), nullable=True)  # pgvector column
+    vector_similarity_score = Column(Float)          # cosine sim vs JD
+    weighted_score = Column(Float)                   # final weighted score
+    score_breakdown = Column(JSON)                   # per-metric scores
+    decision = Column(Enum(DecisionStatus))
+    llm_explanation = Column(Text, nullable=True)    # only for shortlisted/review
+    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
+    evaluated_at = Column(DateTime, nullable=True)
+    job = relationship("JobDescription", back_populates="resumes")
+    audit = relationship("AuditLog", back_populates="resume", uselist=False)
 
-
-class Candidate(Base):
-    __tablename__ = "candidates"
-
-    candidate_id = Column(String, primary_key=True, index=True)
-    job_id = Column(String, ForeignKey("job_descriptions.job_id"), nullable=False)
-    file_name = Column(String, nullable=False)
-    raw_text = Column(Text, nullable=False)
-    parsed_profile = Column(JSON, nullable=True)
-    status = Column(String, nullable=False, default="queued")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    audit_events = relationship("AuditEvent", back_populates="candidate")
-    decision = relationship("Decision", back_populates="candidate", uselist=False)
-
-
-class AuditEvent(Base):
-    __tablename__ = "audit_events"
-
-    id = Column(String, primary_key=True, index=True)
-    candidate_id = Column(String, ForeignKey("candidates.candidate_id"), nullable=False)
-    job_id = Column(String, nullable=False)
-    stage = Column(String, nullable=False)
-    decision = Column(String, nullable=False)
-    details = Column(JSON, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    candidate = relationship("Candidate", back_populates="audit_events")
-
-
-class Decision(Base):
-    __tablename__ = "pipeline_decisions"
-
-    candidate_id = Column(String, ForeignKey("candidates.candidate_id"), primary_key=True, index=True)
-    file_name = Column(String, nullable=False)
-    job_id = Column(String, nullable=False)
-    match_score = Column(Float, nullable=False)
-    decision = Column(String, nullable=False)
-    reason = Column(Text, nullable=False)
-    bias_passed = Column(Boolean, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    candidate = relationship("Candidate", back_populates="decision")
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(String, primary_key=True)
+    resume_id = Column(String, ForeignKey("resumes.id"), nullable=False)
+    job_id = Column(String)
+    decision = Column(Enum(DecisionStatus))
+    vector_similarity_score = Column(Float)
+    weighted_score = Column(Float)
+    score_breakdown = Column(JSON)
+    bias_fields_removed = Column(JSON)
+    guardrail_violations = Column(JSON, default=[])  # any guardrail that fired
+    llm_explanation = Column(Text, nullable=True)
+    reviewer_override = Column(Boolean, default=False)
+    reviewer_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resume = relationship("Resume", back_populates="audit")
