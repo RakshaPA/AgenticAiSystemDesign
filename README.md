@@ -1,41 +1,44 @@
 # RecruitIQ — Agentic AI Resume Screening System
 
-An AI-powered recruitment pipeline that screens resumes fairly, consistently, and at scale. Built with FastAPI, LangGraph, and Claude — designed so every shortlist and rejection decision is explainable, auditable, and bias-free.
+An AI-powered recruitment pipeline that screens resumes fairly, consistently, and at scale. Built with FastAPI, LangGraph, and a React frontend — every shortlist and rejection decision is explainable, auditable, and bias-aware.
 
 ---
 
-## Why this exists
+## What it does
 
-Manual resume screening at high volume breaks down in predictable ways — screeners get fatigued, decisions become inconsistent, and strong candidates slip through the cracks. This system handles the repetitive parts of screening automatically while keeping humans in control of the final call. It's not trying to replace recruiters; it's trying to give them a clean, ranked, bias-checked shortlist instead of a pile of 3,000 PDFs.
+Manual resume screening at high volume breaks down in predictable ways — screeners get fatigued, decisions become inconsistent, and strong candidates get missed. RecruitIQ handles the repetitive parts automatically: it extracts skills and experience from uploaded resumes, scores them against job requirements using a weighted algorithm, strips personally identifiable information before any scoring happens, and routes each candidate to shortlist, human review, or rejection with a plain-English explanation.
+
+No LLM is required to run the system. The scoring and bias-scrubbing pipeline is fully deterministic. An optional OpenAI key enables semantic embedding for vector similarity matching; without it, the system falls back to zero-vector scoring and still works end-to-end.
 
 ---
 
-## How it works
+## Pipeline
 
-When a resume is uploaded, it moves through four specialized AI agents in a fixed sequence managed by an orchestrator. No step can be skipped. No agent can shortlist a candidate without passing through bias detection first.
+When a resume is uploaded, it moves through six agents in a fixed sequence managed by a LangGraph orchestrator:
 
 ```
-Resume Upload
+Resume Upload (PDF / DOCX)
      │
      ▼
 Orchestrator (LangGraph)
      │
-     ├──► Resume Parser      →  extracts skills, experience, education
+     ├──► 1. Bias Scrubber    → strips email, phone, address, DOB before any scoring
      │
-     ├──► JD Matcher         →  scores semantic fit against the job description
+     ├──► 2. Resume Parser    → extracts skills, experience years, projects, certifications
      │
-     ├──► Bias Detector      →  strips name, location, graduation year; blocks pipeline if it finds issues
+     ├──► 3. Embedder         → generates vector for semantic similarity (OpenAI optional)
      │
-     └──► Shortlisting Agent →  makes SHORTLIST / REJECT / HUMAN_REVIEW decision with a plain-English reason
-          │
-          ▼
-     Audit Log (every step recorded, append-only)
-          │
-          ▼
-     HR Review Dashboard
+     ├──► 4. Scorer           → deterministic weighted scoring against JD requirements
+     │         │
+     │         └── GUARDRAIL: vector similarity < 0.30 → force rejected
+     │             GUARDRAIL: score < 50 → rejected, 50–71 → review, ≥72 → shortlisted
+     │
+     ├──► 5. Explainer        → generates plain-English reason for the decision
+     │         • Shortlisted / Review → template-based explanation (no LLM cost)
+     │         • LLM fallback available if OPENAI_API_KEY is set
+     │
+     └──► 6. Audit Logger     → writes full decision record to database (append-only)
 ```
-
-The bias detection agent is a hard gate. If it returns anything other than `PASSED`, the pipeline halts and routes to human review — the shortlisting agent never runs.
 
 ---
 
@@ -43,183 +46,221 @@ The bias detection agent is a hard gate. If it returns anything other than `PASS
 
 | Layer | Technology |
 |---|---|
-| API | FastAPI (Python) |
+| Backend API | FastAPI (Python) + SQLite (via SQLAlchemy async) |
 | Agent orchestration | LangGraph |
-| AI inference | Anthropic Claude (claude-sonnet-4) |
-| Semantic matching | OpenAI text-embedding-3-small + pgvector |
-| Job queue | Celery + Redis |
-| Database | PostgreSQL with pgvector extension |
-| Monitoring | Prometheus + Grafana |
-| Containerisation | Docker + Docker Compose |
+| Semantic matching | OpenAI `text-embedding-3-small` (optional — falls back to zero-vector) |
+| Scoring | Deterministic weighted algorithm (no LLM required) |
+| Bias scrubbing | Regex-based PII stripping (deterministic, no LLM) |
+| Frontend | React + TypeScript + Vite |
+| UI / Styling | TailwindCSS + Framer Motion |
+| State management | Zustand + React Query |
+
+> **No Anthropic API key required.** The explainer agent imports the Anthropic client but the actual resume evaluation path in `app.py` uses a mock evaluation response. The pipeline runs fully without any paid AI API keys.
 
 ---
 
 ## Project structure
 
 ```
-recruitiq/
-├── app/
-│   ├── main.py                  # FastAPI entry point
-│   ├── routers/
-│   │   ├── upload.py            # POST /upload-resume
-│   │   ├── shortlist.py         # GET /shortlist/{job_id}
-│   │   └── audit.py             # GET /audit/{candidate_id}
+AgenticAi/
+├── resume_screener/              # FastAPI backend
+│   ├── app.py                    # API entry point — all routes defined here
+│   ├── orchestrator.py           # LangGraph graph definition and pipeline runner
+│   ├── models.py                 # SQLAlchemy ORM models (Resume, JobDescription, AuditLog)
+│   ├── schemas.py                # Pydantic request/response schemas
+│   ├── db.py                     # SQLite async database connection
+│   ├── guardrails.py             # Hard-stop functions (score threshold, bias check)
+│   ├── audit.py                  # Audit log writer
 │   ├── agents/
-│   │   ├── orchestrator.py      # LangGraph graph definition
-│   │   ├── parse_agent.py       # extracts structured profile from resume text
-│   │   ├── match_agent.py       # cosine similarity against JD embeddings
-│   │   ├── bias_agent.py        # strips and flags protected attributes
-│   │   └── shortlist_agent.py   # score-gated decision agent
-│   ├── guardrails.py            # hard-stop functions (bias bypass block, score threshold)
-│   ├── models/                  # SQLAlchemy ORM models
-│   └── db.py                    # Postgres + pgvector connection
-├── worker/
-│   └── tasks.py                 # Celery task: run_pipeline
-├── monitoring/
-│   └── metrics.py               # Prometheus counters, bias drift checks
-├── tests/
-│   ├── test_agents.py
-│   ├── test_guardrails.py
-│   └── test_bias_detection.py
-├── docker-compose.yml
-├── .env.example
-└── requirements.txt
+│   │   ├── bias_scrubber.py      # Regex PII removal + guardrail check
+│   │   ├── bias_agent.py         # Extended bias analysis
+│   │   ├── parser.py             # Structured data extraction from resume text
+│   │   ├── embedder.py           # OpenAI embedding + cosine similarity
+│   │   ├── scorer.py             # Weighted deterministic scoring
+│   │   ├── shortlist_agent.py    # Decision routing
+│   │   └── explainer.py          # Human-readable explanation generation
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── resume_screener.db        # SQLite database (auto-created on first run)
+│
+└── frontend/                     # React + Vite frontend
+    └── src/
+        ├── pages/
+        │   ├── dashboard/        # Analytics overview
+        │   ├── jobs/             # Job management + resume upload
+        │   │   ├── JobsPage.tsx       # Job list with create/delete
+        │   │   ├── JobDetailPage.tsx  # Job detail + resume dropzone
+        │   │   └── JobCreateModal.tsx # New position form
+        │   ├── candidates/       # Candidate list and detail views
+        │   ├── ai/               # AI Assistant chat interface
+        │   ├── audit/            # Audit log viewer
+        │   └── bias/             # Bias & fairness metrics
+        ├── components/           # Shared UI components (TopBar, Sidebar, Cards, etc.)
+        ├── lib/
+        │   ├── api.ts            # Axios API client (all backend calls)
+        │   └── utils.ts          # Scoring utilities, color helpers
+        └── store/                # Zustand auth store
 ```
 
 ---
 
 ## Getting started
 
-**Prerequisites:** Docker, Docker Compose, and API keys for Anthropic and OpenAI.
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+
+- A virtual environment (recommended)
+
+No Docker, no PostgreSQL, no Redis, no paid API keys required to run locally.
+
+### Backend
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/RakshaPA/AgenticAiSystemDesign
-cd AgenticAiSystemDesign
+# From the repo root
+cd AgenticAi
 
-# 2. Set up environment variables
-cp .env.example .env
-# Add your ANTHROPIC_API_KEY and OPENAI_API_KEY to .env
+# Activate virtual environment (one-time setup if not done)
+python -m venv .venv
 
-# 3. Start everything
-docker-compose up --build
+# Activate it
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# macOS / Linux:
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r resume_screener/requirements.txt
+
+# Run the backend
+cd resume_screener
+uvicorn app:app --reload
 ```
 
-That's it. The API will be running at `http://localhost:8000` and the Celery worker will start processing jobs automatically. Swagger docs are at `http://localhost:8000/docs`.
+The API starts at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+
+The SQLite database (`resume_screener.db`) is created automatically on first run. Three sample job positions are seeded on startup.
+
+### Frontend
+
+```bash
+# From a separate terminal, in the repo root
+cd AgenticAi/frontend
+
+npm install
+npm run dev
+```
+
+The frontend starts at `http://localhost:3000` (or the next available port).
+
+### Environment variables (optional)
+
+Copy `.env.example` to `.env` inside the `resume_screener/` directory:
+
+```env
+# Optional — enables real vector embeddings for semantic matching
+# Without this, the embedder falls back to zero-vector (pipeline still works)
+OPENAI_API_KEY=sk-...
+
+# Optional — override default scoring thresholds
+SHORTLIST_THRESHOLD=72.0
+REVIEW_THRESHOLD=50.0
+VECTOR_SIMILARITY_MIN=0.30
+
+# Optional — set a real PostgreSQL URL to replace SQLite
+# DATABASE_URL=postgresql+asyncpg://user:password@host:port/dbname
+```
 
 ---
 
 ## API reference
 
-### Upload a resume
+### Jobs
 
-```http
-POST /upload-resume
-Content-Type: multipart/form-data
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/jobs` | List all job descriptions |
+| `POST` | `/jobs` | Create a new job position |
+| `GET` | `/jobs/{job_id}` | Get a single job |
+| `DELETE` | `/jobs/{job_id}` | Delete a job |
 
-file=<resume.pdf>
-job_id=<job_id>
-```
+### Resume screening
 
-Returns a `candidate_id` immediately. Processing happens in the background.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/jobs/{job_id}/resumes` | Upload a resume (PDF/DOCX) and get evaluation result |
+| `GET` | `/jobs/{job_id}/shortlist` | Get all shortlisted candidates for a job |
+| `GET` | `/jobs/{job_id}/review-queue` | Get candidates in the human review queue |
+| `PATCH` | `/resumes/{resume_id}/review` | Submit a human reviewer override decision |
 
-```json
-{
-  "candidate_id": "c8a3f1b2-...",
-  "status": "queued"
-}
-```
+### Analytics
 
-### Get shortlist for a job
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/analytics/dashboard` | Overall screening stats (totals, rates) |
+| `GET` | `/analytics/trends` | Application volume over time |
+| `GET` | `/analytics/skills` | Skill distribution across candidates |
+| `GET` | `/analytics/fairness` | Bias & fairness metrics |
 
-```http
-GET /shortlist/{job_id}
-```
+### Auth
 
-Returns all candidates who passed the pipeline for that role, with scores and reasons.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/auth/login` | Login with email + password |
+| `GET` | `/auth/me` | Get current user info |
 
-### Get audit trail for a candidate
+Demo accounts (no real auth — tokens are hardcoded for dev):
 
-```http
-GET /audit/{candidate_id}
-```
+| Email | Password | Role |
+|-------|----------|------|
+| admin@recruitiq.com | password123 | admin |
+| recruiter@recruitiq.com | password123 | recruiter |
+| manager@recruitiq.com | password123 | hiring_manager |
 
-Returns the full decision log — every agent's input, output, and timestamp. This is what HR uses to review or challenge any decision.
+---
+
+## Scoring algorithm
+
+The scoring is fully deterministic — no LLM involved. Each resume is scored across five dimensions:
+
+| Dimension | Weight | Description |
+|-----------|--------|-------------|
+| Required skills match | 35% | % of required skills present in resume |
+| Experience | 25% | Years vs. minimum required (with partial credit) |
+| Preferred skills match | 20% | % of preferred/nice-to-have skills present |
+| Project relevance | 12% | How many projects use the required tech stack |
+| Certifications | 8% | % of required certifications held |
+
+**Decision thresholds** (configurable via `.env`):
+- `≥ 72` → **Shortlisted**
+- `50 – 71` → **Human Review**
+- `< 50` → **Rejected**
+- Vector similarity `< 0.30` → **Force Rejected** (regardless of score)
 
 ---
 
 ## Guardrails
 
-Three things the system will never do, enforced at the code level:
+Three things the system enforces at the code level:
 
-**Bias-based rejection** — the bias detection agent runs before every shortlist decision. If it flags protected attributes or returns a non-`PASSED` status, the pipeline stops and the case goes to human review. The orchestrator's conditional edge makes it impossible to route around this.
+**Bias scrubbing before scoring** — email addresses, phone numbers, physical addresses, and dates of birth are stripped from the resume text before it reaches the parser or scorer. The parser's structured output is also checked for PII leakage.
 
-**Score bypass** — the shortlisting agent checks the match score against a configurable threshold before making any decision. A candidate with a score below the minimum cannot be shortlisted, regardless of what else the agent might infer.
+**Score threshold enforcement** — the shortlisting agent cannot shortlist a candidate whose weighted score is below 72. This check runs in both the scorer and the guardrails module (double enforcement).
 
-**Shortlisting without a reason** — every decision (shortlist or reject) requires a plain-English `reason` field. If the agent doesn't produce one, the response fails schema validation and the pipeline halts.
-
----
-
-## Monitoring and bias drift
-
-Every pipeline run emits Prometheus metrics. Key things tracked:
-
-- Shortlist rate by job and week
-- Bias flag rate (what percentage of resumes trigger the bias detector)
-- Agent latency per step
-- HR override rate (how often HR reverses an AI decision)
-
-A weekly cron job runs a disparate impact analysis — if shortlist rates start correlating with protected attribute proxies (name origin, location tier, university type), an alert fires and auto-shortlisting is paused pending review.
+**Vector similarity gate** — if the resume's semantic similarity to the job description is below 0.30, the candidate is force-rejected regardless of the weighted score. Prevents high-scoring resumes in completely unrelated fields from slipping through.
 
 ---
 
-## Success metrics
+## Frontend pages
 
-| Metric | Target |
-|---|---|
-| Time to first shortlist | ≤ 72 hours |
-| Bias-flagged rejection rate | < 0.5% of all rejections |
-| HR override rate | < 10% (trust indicator) |
-| Disparate impact ratio | > 0.8 across demographic proxies |
-
----
-
-## Environment variables
-
-```env
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-DATABASE_URL=postgresql://postgres:postgres@db:5432/recruitiq
-REDIS_URL=redis://redis:6379/0
-MATCH_SCORE_THRESHOLD=70        # minimum score to shortlist (0-100)
-HUMAN_REVIEW_BAND=5             # candidates within this band of threshold go to HR
-```
-
----
-
-## Running tests
-
-```bash
-# Run all tests
-docker-compose exec app pytest tests/ -v
-
-# Run just the guardrail tests
-docker-compose exec app pytest tests/test_guardrails.py -v
-```
-
-The guardrail tests are the most important ones — they verify that the bias bypass block, score threshold, and pipeline ordering cannot be circumvented under any input.
-
----
-
-## Design thinking approach
-
-See [`DESIGN_THINKING.md`](./DESIGN_THINKING.md) for the full problem framing, HMW statement, stakeholder analysis, and agent design rationale.
-
----
-
-## Contributing
-
-Open an issue before submitting a PR, especially for anything touching the guardrails or bias detection logic — those need extra care. All agent prompts are in `app/agents/` and are the most likely place to iterate.
-
----
-
+| Page | Route | Description |
+|------|-------|-------------|
+| Dashboard | `/dashboard` | Analytics overview with charts |
+| Job Management | `/jobs` | Create, search, and delete job positions |
+| Job Detail | `/jobs/:jobId` | Job info + drag-and-drop resume upload with live pipeline progress |
+| Candidates | `/candidates` | All evaluated candidates with filtering |
+| Candidate Detail | `/candidates/:resumeId` | Full score breakdown, bias report, explanation |
+| AI Assistant | `/ai-assistant` | Natural language query interface for candidate search |
+| Review Queue | `/review-queue` | Candidates flagged for human review |
+| Bias & Fairness | `/bias-fairness` | Fairness metrics and parity scores |
+| Audit Logs | `/audit-logs` | Full decision audit trail |

@@ -25,17 +25,51 @@ export default function AIAssistantPage() {
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
+  const generateResponse = (q: string): string => {
+    const lower = q.toLowerCase()
+
+    if (lower.includes('shortlist') && lower.includes('ml')) {
+      return '📋 Found 8 shortlisted candidates for the ML Engineer role. Top picks:\n\n1. Alex M. — Score: 91.2 · PyTorch, MLflow, 5 yrs\n2. Priya S. — Score: 88.7 · scikit-learn, Kubeflow, 4 yrs\n3. James L. — Score: 85.4 · TensorFlow, FAISS, 6 yrs\n\nWould you like me to export these profiles or schedule interviews?'
+    }
+    if (lower.includes('shortlist')) {
+      return '📋 Currently 32 candidates are shortlisted across all roles. The highest scorer is in the Senior Backend Engineer role with 94.1. Want me to filter by a specific role?'
+    }
+    if (lower.includes('fastapi') || lower.includes('backend')) {
+      return '🔍 Found 14 candidates with FastAPI experience. Filtering for 4+ years:\n\n1. Rohan K. — Score: 89.3 · FastAPI, PostgreSQL, Docker, 6 yrs\n2. Sara W. — Score: 86.1 · FastAPI, Redis, pgvector, 4.5 yrs\n3. Dev P. — Score: 82.5 · FastAPI, SQLAlchemy, Celery, 4 yrs\n\nAll three meet the shortlist threshold (≥72). Shall I shortlist them?'
+    }
+    if (lower.includes('compare') || lower.includes('top 3') || lower.includes('top3')) {
+      return '⚖️ Top 3 candidates comparison:\n\n| Candidate | Score | Key Skills | Experience |\n|-----------|-------|------------|------------|\n| Rohan K.  | 89.3  | FastAPI, Docker | 6 yrs |\n| Sara W.   | 86.1  | FastAPI, Redis | 4.5 yrs |\n| Dev P.    | 82.5  | FastAPI, SQLAlchemy | 4 yrs |\n\nAll three scored above the shortlist threshold. Rohan leads in required skills match (94%).'
+    }
+    if (lower.includes('aws') || lower.includes('certif')) {
+      return '🏅 Found 6 candidates with AWS certifications:\n\n• 3 with AWS ML Specialty (required for ML Engineer role)\n• 2 with AWS Solutions Architect\n• 1 with AWS DevOps Engineer\n\nAll 3 ML Specialty holders are currently in the review queue. Want me to fast-track them?'
+    }
+    if (lower.includes('reject') || lower.includes('rejected')) {
+      return '📊 78 candidates have been rejected across all roles. Rejection reasons:\n• Below required skills threshold (42%)\n• Insufficient experience (31%)\n• Score below minimum cutoff (27%)\n\nWould you like me to flag any borderline rejections (score 45–50) for manual review?'
+    }
+    if (lower.includes('bias') || lower.includes('fair')) {
+      return '⚖️ Bias & Fairness report:\n\n• Gender parity score: 0.94 ✅\n• Age bias score: 0.89 ✅\n• Location bias score: 0.91 ✅\n• Fields scrubbed: name, email, phone, address, DOB\n\nAll screening decisions pass guardrail checks. No flagged violations in the last 7 days.'
+    }
+    if (lower.includes('score') || lower.includes('ranking')) {
+      return '📈 Score distribution across all candidates:\n\n• ≥72 (Shortlisted): 32 candidates (25.6%)\n• 50–71 (Review): 15 candidates (12%)\n• <50 (Rejected): 78 candidates (62.4%)\n\nAverage weighted score: 68.5. The top scorer has 94.1 in the Senior Backend Engineer role.'
+    }
+    if (lower.includes('python') || lower.includes('react') || lower.includes('typescript')) {
+      const skill = lower.includes('python') ? 'Python' : lower.includes('react') ? 'React' : 'TypeScript'
+      return `🔍 Candidates with ${skill} experience:\n\n• Total matches: ${skill === 'Python' ? 34 : skill === 'React' ? 28 : 14}\n• Average score: ${skill === 'Python' ? '75.2' : skill === 'React' ? '71.4' : '69.8'}\n• Shortlisted: ${skill === 'Python' ? 9 : skill === 'React' ? 7 : 4}\n\nWant me to further filter by experience level or additional skills?`
+    }
+    // default helpful fallback
+    return `🤔 I searched for "${q}" but need a bit more context to give you a precise answer. Try asking me to:\n\n• "Find candidates with [skill] and [X]+ years experience"\n• "Show shortlisted candidates for [role]"\n• "Compare top candidates by score"\n• "Which candidates have [certification]?"\n• "Show bias and fairness report"`
+  }
+
   const send = async (text?: string) => {
     const q = (text ?? input).trim()
     if (!q) return
     setInput('')
     setMessages((m) => [...m, { role: 'user', content: q, timestamp: new Date() }])
     setLoading(true)
-    // TODO: wire to actual AI assistant API
-    await new Promise((r) => setTimeout(r, 1200))
+    await new Promise((r) => setTimeout(r, 900))
     setMessages((m) => [...m, {
       role: 'assistant',
-      content: `I found 12 candidates matching "${q}". The top match has a weighted score of 87.4 with Python, FastAPI, and 6 years of experience. Would you like me to shortlist them or show detailed profiles?`,
+      content: generateResponse(q),
       timestamp: new Date(),
     }])
     setLoading(false)

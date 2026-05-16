@@ -7,9 +7,9 @@ import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
 import { jobsApi } from '@/lib/api'
 
-interface Props { onClose: () => void }
+interface Props { onClose: () => void; onCreate?: (data: any) => void }
 
-export function JobCreateModal({ onClose }: Props) {
+export function JobCreateModal({ onClose, onCreate }: Props) {
   const qc = useQueryClient()
   const [reqSkill, setReqSkill]   = useState('')
   const [prefSkill, setPrefSkill] = useState('')
@@ -40,7 +40,11 @@ export function JobCreateModal({ onClose }: Props) {
 
   const { mutate, isPending } = useMutation({
     mutationFn: (data: unknown) => jobsApi.create(data),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['jobs'] }); onClose() },
+    onSuccess: (data) => { 
+      qc.invalidateQueries({ queryKey: ['jobs'] }); 
+      if (onCreate) onCreate(data);
+      onClose(); 
+    },
   })
 
   return (
@@ -63,7 +67,7 @@ export function JobCreateModal({ onClose }: Props) {
 
           <form onSubmit={handleSubmit((d) => mutate(d))} className="space-y-5">
             <Input label="Job Title" placeholder="Senior Backend Engineer"
-              error={errors.title?.message} {...register('title', { required: 'Required' })} />
+              error={errors.title?.message as string | undefined} {...register('title', { required: 'Required' })} />
 
             <div className="flex flex-col gap-1.5">
               <label className="text-xs font-medium text-gray-400">Job Description</label>
